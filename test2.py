@@ -70,10 +70,10 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
 
     # 1. 情感分类（SST-2）- 增加网络异常处理
     try:
+        # 移除 timeout=60 参数，因为它不被 BuilderConfig 支持
         sst2 = load_dataset(
             "glue", "sst2",
             trust_remote_code=True,
-            timeout=60  # 延长超时，解决SSL错误
         )["validation"].shuffle(seed=42).select(range(TEST_SAMPLE_SIZE))
         datasets_dict["sentiment_classification"] = sst2.map(
             lambda x: {"input": x["sentence"], "output": str(x["label"])}
@@ -85,10 +85,10 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
 
     # 2. 实体抽取（CONLL03）- 手动标签映射，解决Sequence无int2str
     try:
+        # 移除 timeout=60 参数，因为它不被 BuilderConfig 支持
         conll03_dataset = load_dataset(
             "conll2003",
             trust_remote_code=True,
-            timeout=60
         )
         conll03 = conll03_dataset["validation"].shuffle(seed=42).select(range(TEST_SAMPLE_SIZE))
 
@@ -126,10 +126,10 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
 
     # 3. 数学推理（GSM8K）
     try:
+        # 移除 timeout=60 参数，因为它不被 BuilderConfig 支持
         gsm8k = load_dataset(
             "gsm8k", "main",
             trust_remote_code=True,
-            timeout=60
         )["test"].shuffle(seed=42).select(range(TEST_SAMPLE_SIZE))
         datasets_dict["math_reasoning"] = gsm8k.map(
             lambda x: {"input": x["question"], "output": x["answer"].split("\n")[-1].replace("#### ", "")}
