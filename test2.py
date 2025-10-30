@@ -1,18 +1,18 @@
-# 解决 Windows 符号链接警告 + 自定义缓存目录
+# 环境配置与基础导入
 import os
 
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_DATASETS_CACHE"] = "D:/huggingface/datasets"
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["HF_HUB_RETRY_TIMEOUT"] = "30"  # 延长HF Hub超时时间，解决SSL错误
 
-# 基础导入
 import time
 import json
 import random
+import re
 from typing import List, Dict, Tuple
 from collections import Counter
 
-# DSPy 核心导入（适配新版 API）
 import dspy
 from dspy import Signature, InputField, OutputField, Predict
 import datasets
@@ -22,17 +22,20 @@ from tiktoken import encoding_for_model
 from transformers import AutoTokenizer
 
 # ====================== 全局配置 ======================
-# Ollama 模型配置
+# Ollama 配置
 OLLAMA_MODEL_NAME = "llama3.1:8b"
 OLLAMA_API_BASE = "http://localhost:11434"
 OLLAMA_API_KEY = ""
-OLLAMA_TEMPERATURE = 0.0  # 显式定义温度，避免访问 LM 属性
+OLLAMA_TEMPERATURE = 0.0
 
 # 任务与评估配置
 TASKS = ["sentiment_classification", "named_entity_recognition", "math_reasoning"]
 FEW_SHOT_K = 3
-SELF_CONSISTENCY_SAMPLES = 3  # 减少采样次数，加快测试
-TEST_SAMPLE_SIZE = 10  # 减少样本数，快速验证
+SELF_CONSISTENCY_SAMPLES = 3
+TEST_SAMPLE_SIZE = 20  # 增加样本数，提升结果可信度
+CONLL03_NER_TAGS = [  # 手动定义CONLL03标签映射（解决int2str问题）
+    "O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-MISC", "I-MISC"
+]
 
 # Token 统计配置
 try:
@@ -41,20 +44,17 @@ except:
     TOKENIZER = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B", trust_remote_code=True)
 
 
-# ====================== 模型初始化（修复 temperature 问题） ======================
+# ====================== 模型初始化 ======================
 def init_dspy_model():
-    """初始化 DSPy + Ollama 模型（显式保存温度参数）"""
     try:
-        # 初始化 Ollama LM（适配新版 DSPy）
         lm = dspy.LM(
             model=f"ollama_chat/{OLLAMA_MODEL_NAME}",
             api_base=OLLAMA_API_BASE,
             api_key=OLLAMA_API_KEY,
             max_tokens=1024,
-            temperature=OLLAMA_TEMPERATURE,  # 传入温度参数
+            temperature=OLLAMA_TEMPERATURE,
             timeout=300,
         )
-        # 绑定模型到 DSPy
         dspy.settings.configure(lm=lm)
         print(f"✅ Ollama模型初始化完成！模型：{OLLAMA_MODEL_NAME}，温度：{OLLAMA_TEMPERATURE}")
         return lm
@@ -63,17 +63,17 @@ def init_dspy_model():
         exit(1)
 
 
-# ====================== 数据集加载（修复 CONLL03 加载问题） ======================
+# ====================== 数据集加载（彻底修复CONLL03） ======================
 def load_and_process_datasets() -> Dict[str, Dataset]:
-    """加载并处理数据集（修复 CONLL03 features 访问错误）"""
     datasets_dict = {}
     print("\n📥 正在加载数据集...")
 
-    # 1. 情感分类（SST-2）
+    # 1. 情感分类（SST-2）- 增加网络异常处理
     try:
         sst2 = load_dataset(
             "glue", "sst2",
-            trust_remote_code=True
+            trust_remote_code=True,
+            timeout=60  # 延长超时，解决SSL错误
         )["validation"].shuffle(seed=42).select(range(TEST_SAMPLE_SIZE))
         datasets_dict["sentiment_classification"] = sst2.map(
             lambda x: {"input": x["sentence"], "output": str(x["label"])}
@@ -81,31 +81,33 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
         print("✅ SST-2 数据集加载完成")
     except Exception as e:
         print(f"❌ SST-2 加载失败：{str(e)}")
+        print("💡 建议：检查网络代理，或重试加载")
 
-    # 2. 实体抽取（CONLL03）- 核心修复：先取 split 再访问 features
+    # 2. 实体抽取（CONLL03）- 手动标签映射，解决Sequence无int2str
     try:
-        # 加载完整 DatasetDict，再取 validation split
-        conll03_dataset = load_dataset("conll2003", trust_remote_code=True)
+        conll03_dataset = load_dataset(
+            "conll2003",
+            trust_remote_code=True,
+            timeout=60
+        )
         conll03 = conll03_dataset["validation"].shuffle(seed=42).select(range(TEST_SAMPLE_SIZE))
-
-        # 正确获取标签映射（从 split 的 features 中）
-        tag_map = conll03.features["ner_tags"].int2str
 
         def process_ner(example):
             tokens = example["tokens"]
-            tags = example["ner_tags"]
+            tags = example["ner_tags"]  # tags是0-8的整数列表
             entities = []
             current_entity = None
-            for token, tag in zip(tokens, tags):
-                tag_name = tag_map(tag)  # 使用 split 的 features 映射标签
-                if tag_name.startswith("B-"):
+
+            for token, tag_idx in zip(tokens, tags):
+                tag_name = CONLL03_NER_TAGS[tag_idx]  # 手动映射标签
+                if tag_name.startswith("B-"):  # 实体开始
                     if current_entity:
                         entities.append(current_entity)
                     entity_type = tag_name.split("-")[1]
                     current_entity = {"type": entity_type, "text": token}
-                elif tag_name.startswith("I-") and current_entity:
+                elif tag_name.startswith("I-") and current_entity:  # 实体继续
                     current_entity["text"] += " " + token
-                else:
+                else:  # 实体结束
                     if current_entity:
                         entities.append(current_entity)
                         current_entity = None
@@ -126,7 +128,8 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
     try:
         gsm8k = load_dataset(
             "gsm8k", "main",
-            trust_remote_code=True
+            trust_remote_code=True,
+            timeout=60
         )["test"].shuffle(seed=42).select(range(TEST_SAMPLE_SIZE))
         datasets_dict["math_reasoning"] = gsm8k.map(
             lambda x: {"input": x["question"], "output": x["answer"].split("\n")[-1].replace("#### ", "")}
@@ -139,15 +142,13 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
 
 
 def get_few_shot_examples(dataset: Dataset, k: int) -> List[dspy.Example]:
-    """获取 Few-shot 样例"""
     return [dspy.Example(**item) for item in dataset.select(range(k))]
 
 
-# ====================== 提示策略模块（修复 Predict signature 问题） ======================
-# 定义通用 Signature（适配新版 DSPy 的 Predict 要求）
+# ====================== 提示策略模块（修复Prompt保存与统计） ======================
+# 所有模块新增 `current_prompt` 属性，保存当前推理用的prompt
 # ---------------------- 1. 情感分类模块 ----------------------
 class SentimentSignature(Signature):
-    """情感分类的输入输出定义"""
     input = InputField(desc="需要判断情感的句子")
     label = OutputField(desc="情感标签，仅 0（负面）或 1（正面）")
 
@@ -155,15 +156,14 @@ class SentimentSignature(Signature):
 class SentimentZeroShot(dspy.Module):
     def __init__(self):
         super().__init__()
-        # 用 Signature 初始化 Predict（修复缺少 signature 问题）
         self.predict = Predict(SentimentSignature)
+        self.current_prompt = ""  # 保存当前prompt，用于Token统计
 
     def forward(self, input: str) -> dspy.Prediction:
-        prompt = f"""判断以下句子的情感倾向，仅输出 0（负面）或 1（正面），无需额外解释：
+        self.current_prompt = f"""判断以下句子的情感倾向，仅输出 0（负面）或 1（正面），无需额外解释：
 句子：{input}
 情感标签："""
-        # 调用 predict 时传入输入参数
-        return self.predict(input=input, prompt=prompt)
+        return self.predict(input=input, prompt=self.current_prompt)
 
 
 class SentimentFewShot(dspy.Module):
@@ -171,19 +171,19 @@ class SentimentFewShot(dspy.Module):
         super().__init__()
         self.few_shot_examples = few_shot_examples
         self.predict = Predict(SentimentSignature)
+        self.current_prompt = ""
 
     def forward(self, input: str) -> dspy.Prediction:
         examples_str = "\n".join([f"句子：{ex.input}\n情感标签：{ex.output}" for ex in self.few_shot_examples])
-        prompt = f"""根据以下样例，判断新句子的情感倾向，仅输出 0（负面）或 1（正面），无需额外解释：
+        self.current_prompt = f"""根据以下样例，判断新句子的情感倾向，仅输出 0（负面）或 1（正面），无需额外解释：
 {examples_str}
 新句子：{input}
 情感标签："""
-        return self.predict(input=input, prompt=prompt)
+        return self.predict(input=input, prompt=self.current_prompt)
 
 
 # ---------------------- 2. 实体抽取模块 ----------------------
 class NERSignature(Signature):
-    """实体抽取的输入输出定义"""
     input = InputField(desc="需要抽取实体的文本")
     entities = OutputField(desc="JSON格式的实体列表，key: type（PER/ORG/LOC/MISC）、text")
 
@@ -192,12 +192,13 @@ class NERZeroShot(dspy.Module):
     def __init__(self):
         super().__init__()
         self.predict = Predict(NERSignature)
+        self.current_prompt = ""
 
     def forward(self, input: str) -> dspy.Prediction:
-        prompt = f"""从以下文本中抽取人名（PER）、机构（ORG）、地点（LOC）、其他（MISC）类型的实体，输出 JSON 格式（key: type, text），无实体则输出空列表：
+        self.current_prompt = f"""从以下文本中抽取人名（PER）、机构（ORG）、地点（LOC）、其他（MISC）类型的实体，输出 JSON 格式（key: type, text），无实体则输出空列表：
 文本：{input}
 实体 JSON："""
-        return self.predict(input=input, prompt=prompt)
+        return self.predict(input=input, prompt=self.current_prompt)
 
 
 class NERFewShot(dspy.Module):
@@ -205,25 +206,24 @@ class NERFewShot(dspy.Module):
         super().__init__()
         self.few_shot_examples = few_shot_examples
         self.predict = Predict(NERSignature)
+        self.current_prompt = ""
 
     def forward(self, input: str) -> dspy.Prediction:
         examples_str = "\n".join([f"文本：{ex.input}\n实体 JSON：{ex.output}" for ex in self.few_shot_examples])
-        prompt = f"""根据以下样例，从新文本中抽取人名（PER）、机构（ORG）、地点（LOC）、其他（MISC）类型的实体，输出 JSON 格式（key: type, text），无实体则输出空列表：
+        self.current_prompt = f"""根据以下样例，从新文本中抽取人名（PER）、机构（ORG）、地点（LOC）、其他（MISC）类型的实体，输出 JSON 格式（key: type, text），无实体则输出空列表：
 {examples_str}
 新文本：{input}
 实体 JSON："""
-        return self.predict(input=input, prompt=prompt)
+        return self.predict(input=input, prompt=self.current_prompt)
 
 
-# ---------------------- 3. 数学推理模块 ----------------------
+# ---------------------- 3. 数学推理模块（增强答案归一化） ----------------------
 class MathZeroShotSignature(Signature):
-    """数学推理（零样本）的输入输出定义"""
     input = InputField(desc="数学问题")
     answer = OutputField(desc="最终答案，仅数字")
 
 
 class MathCoTSignature(Signature):
-    """数学推理（CoT）的输入输出定义"""
     input = InputField(desc="数学问题")
     reasoning = OutputField(desc="分步推理过程")
     answer = OutputField(desc="最终答案，用 #### 标记")
@@ -233,12 +233,13 @@ class MathZeroShot(dspy.Module):
     def __init__(self):
         super().__init__()
         self.predict = Predict(MathZeroShotSignature)
+        self.current_prompt = ""
 
     def forward(self, input: str) -> dspy.Prediction:
-        prompt = f"""解决以下数学问题，仅输出最终答案（数字），无需额外解释：
+        self.current_prompt = f"""解决以下数学问题，仅输出最终答案（数字），无需额外解释：
 问题：{input}
 答案："""
-        return self.predict(input=input, prompt=prompt)
+        return self.predict(input=input, prompt=self.current_prompt)
 
 
 class MathFewShot(dspy.Module):
@@ -246,75 +247,97 @@ class MathFewShot(dspy.Module):
         super().__init__()
         self.few_shot_examples = few_shot_examples
         self.predict = Predict(MathZeroShotSignature)
+        self.current_prompt = ""
 
     def forward(self, input: str) -> dspy.Prediction:
         examples_str = "\n".join([f"问题：{ex.input}\n答案：{ex.output}" for ex in self.few_shot_examples])
-        prompt = f"""根据以下样例，解决新数学问题，仅输出最终答案（数字），无需额外解释：
+        self.current_prompt = f"""根据以下样例，解决新数学问题，仅输出最终答案（数字），无需额外解释：
 {examples_str}
 新问题：{input}
 答案："""
-        return self.predict(input=input, prompt=prompt)
+        return self.predict(input=input, prompt=self.current_prompt)
 
 
 class MathCoT(dspy.Module):
     def __init__(self):
         super().__init__()
         self.predict = Predict(MathCoTSignature)
+        self.current_prompt = ""
 
     def forward(self, input: str) -> dspy.Prediction:
-        prompt = f"""解决以下数学问题，请先分步写出推理过程，最后用 #### 标注最终答案（仅数字）：
+        self.current_prompt = f"""解决以下数学问题，请先分步写出推理过程，最后用 #### 标注最终答案（仅数字，不要单位）：
 问题：{input}
 推理过程："""
-        response = self.predict(input=input, prompt=prompt)
-        # 提取最终答案
-        answer = response.answer.split("####")[-1].strip() if "####" in str(response.answer) else str(
-            response.answer).strip()
-        return dspy.Prediction(reasoning=response.reasoning, answer=answer)
+        response = self.predict(input=input, prompt=self.current_prompt)
+        # 提取答案（兼容模型未按 #### 标记的情况）
+        answer = str(response.answer).strip()
+        if "####" in answer:
+            answer = answer.split("####")[-1].strip()
+        # 进一步清理答案（去除括号、单位）
+        answer = re.sub(r"[()（）a-zA-Z$￥元个只]", "", answer).strip()
+        return dspy.Prediction(reasoning=response.reasoning, answer=answer, prompt=self.current_prompt)
 
 
 class MathSelfConsistency(dspy.Module):
-    """修复 temperature 访问问题，用全局温度参数"""
-
     def __init__(self, num_samples: int = SELF_CONSISTENCY_SAMPLES):
         super().__init__()
         self.num_samples = num_samples
         self.cot_module = MathCoT()
-        self.base_temperature = OLLAMA_TEMPERATURE  # 使用全局定义的温度，避免访问 LM 属性
+        self.base_temperature = OLLAMA_TEMPERATURE
+        self.current_prompt = ""  # 保存最后一次采样的prompt
 
     def normalize_answer(self, ans: str) -> str:
+        """增强答案归一化：处理单位、分数、科学计数法"""
+        if not ans:
+            return ""
+        # 1. 去除无关字符（单位、括号、字母）
+        ans = re.sub(r"[()（）a-zA-Z$￥元个只台辆]", "", ans).strip()
+        # 2. 处理分数（如 "3/4" → 0.75）
+        if "/" in ans and len(ans.split("/")) == 2:
+            try:
+                numerator, denominator = ans.split("/")
+                return str(round(float(numerator) / float(denominator), 2))
+            except:
+                pass
+        # 3. 处理科学计数法（如 "2e3" → 2000.0）
         try:
-            return str(round(float(ans.replace(",", "").strip()), 2))
+            return str(round(float(ans), 2))
         except:
             return ans.strip().lower()
 
     def forward(self, input: str) -> dspy.Prediction:
         samples = []
         for _ in range(self.num_samples):
-            # 临时调整温度（通过 LM 的 kwargs 更新）
             dspy.settings.lm.kwargs["temperature"] = 0.7
             pred = self.cot_module(input)
             samples.append((pred.reasoning, pred.answer))
+            self.current_prompt = pred.prompt  # 保存prompt
 
-        # 恢复基准温度
+        # 恢复温度
         dspy.settings.lm.kwargs["temperature"] = self.base_temperature
 
         # 多数投票
         normalized_answers = [self.normalize_answer(ans) for _, ans in samples]
-        vote_result = Counter(normalized_answers).most_common(1)[0][0]
+        # 过滤空答案后投票
+        valid_answers = [a for a in normalized_answers if a]
+        if not valid_answers:
+            vote_result = ""
+        else:
+            vote_result = Counter(valid_answers).most_common(1)[0][0]
 
-        # 汇总推理过程
+        # 汇总推理
         combined_reasoning = "\n--- 采样推理过程 ---\n".join(
-            [f"推理 {i + 1}：{reasoning}" for i, (reasoning, _) in enumerate(samples)])
+            [f"推理 {i + 1}：{reasoning}\n答案：{ans}" for i, (reasoning, ans) in enumerate(samples)])
         return dspy.Prediction(
             reasoning=combined_reasoning,
             answer=vote_result,
-            all_answers=normalized_answers
+            all_answers=normalized_answers,
+            prompt=self.current_prompt
         )
 
 
-# ====================== 评估指标计算（修复 Token 统计） ======================
+# ====================== 评估指标计算（修复统计与可信度验证） ======================
 def count_tokens(text: str) -> int:
-    """修复 Token 统计，处理空文本"""
     if not text:
         return 0
     try:
@@ -327,25 +350,26 @@ def count_tokens(text: str) -> int:
 
 
 def evaluate_sentiment(preds: List[str], refs: List[str]) -> Dict[str, float]:
-    """修复情感分类评估，处理空预测"""
+    """增加调试信息，验证100%准确率真实性"""
     correct = 0
     valid_count = 0
-    for pred, ref in zip(preds, refs):
+    # 打印前5个pred和ref对比
+    print("\n🔍 情感分类预测验证（前5个样本）：")
+    for i, (pred, ref) in enumerate(zip(preds[:5], refs[:5])):
+        print(f"  样本{i + 1}：pred={pred}，ref={ref}")
         if not pred:
             continue
-        # 提取预测中的数字
         pred_label = [c for c in str(pred) if c in ["0", "1"]]
         pred_label = pred_label[0] if pred_label else "invalid"
         if pred_label == ref:
             correct += 1
         valid_count += 1
     accuracy = correct / valid_count if valid_count > 0 else 0.0
+    print(f"  总准确率：{round(accuracy * 100, 2)}%（{correct}/{valid_count}）")
     return {"accuracy": round(accuracy * 100, 2)}
 
 
 def evaluate_ner(preds: List[str], refs: List[str]) -> Dict[str, float]:
-    """修复实体抽取评估，处理空预测"""
-
     def parse_entities(json_str: str) -> List[Tuple[str, str]]:
         if not json_str:
             return []
@@ -360,7 +384,12 @@ def evaluate_ner(preds: List[str], refs: List[str]) -> Dict[str, float]:
     all_ref_tags = []
     global test_data
     valid_count = 0
-    for pred_str, ref_str, input_text in zip(preds, refs, [ex["input"] for ex in test_data]):
+    print("\n🔍 实体抽取预测验证（前2个样本）：")
+    for i, (pred_str, ref_str, input_text) in enumerate(
+            zip(preds[:2], refs[:2], [ex["input"] for ex in test_data[:2]])):
+        print(f"  样本{i + 1}：文本={input_text[:50]}...")
+        print(f"         pred_entities={parse_entities(str(pred_str))}")
+        print(f"         ref_entities={parse_entities(str(ref_str))}")
         if not input_text:
             continue
         valid_count += 1
@@ -371,7 +400,7 @@ def evaluate_ner(preds: List[str], refs: List[str]) -> Dict[str, float]:
         pred_tags = ["O"] * len(tokens)
         ref_tags = ["O"] * len(tokens)
 
-        # 标记实体标签
+        # 标记实体
         for ent_text, ent_type in pred_entities:
             ent_tokens = ent_text.split()
             for i in range(len(tokens) - len(ent_tokens) + 1):
@@ -391,31 +420,31 @@ def evaluate_ner(preds: List[str], refs: List[str]) -> Dict[str, float]:
         all_ref_tags.append(ref_tags)
 
     f1 = f1_score(all_ref_tags, all_pred_tags, average="micro") * 100 if valid_count > 0 else 0.0
+    print(f"  实体抽取F1分数：{round(f1, 2)}%")
     return {"f1_score": round(f1, 2)}
 
 
 def evaluate_math(preds: List[str], refs: List[str]) -> Dict[str, float]:
-    """修复数学推理评估，处理空预测"""
+    """增加调试信息，查看答案归一化效果"""
     correct = 0
     valid_count = 0
-    for pred, ref in zip(preds, refs):
-        if not pred or not ref:
-            continue
-
-        def normalize(ans: str) -> str:
-            try:
-                return str(round(float(ans.replace(",", "").strip()), 2))
-            except:
-                return ans.strip().lower()
-
-        if normalize(str(pred)) == normalize(ref):
-            correct += 1
-        valid_count += 1
+    print("\n🔍 数学推理预测验证（前5个样本）：")
+    for i, (pred, ref) in enumerate(zip(preds[:5], refs[:5])):
+        # 归一化前后对比
+        norm_pred = MathSelfConsistency().normalize_answer(pred)
+        norm_ref = MathSelfConsistency().normalize_answer(ref)
+        is_correct = "✅" if norm_pred == norm_ref else "❌"
+        print(f"  样本{i + 1}：pred={pred} → norm={norm_pred}；ref={ref} → norm={norm_ref}；{is_correct}")
+        if norm_pred and norm_ref:
+            if norm_pred == norm_ref:
+                correct += 1
+            valid_count += 1
     accuracy = correct / valid_count if valid_count > 0 else 0.0
+    print(f"  总准确率：{round(accuracy * 100, 2)}%（{correct}/{valid_count}）")
     return {"accuracy": round(accuracy * 100, 2)}
 
 
-# ====================== 实验主函数（修复推理逻辑） ======================
+# ====================== 实验主函数（修复Prompt统计） ======================
 def run_experiment(task_name: str, strategy: str) -> Dict[str, any]:
     global test_data
     datasets_dict = load_and_process_datasets()
@@ -467,7 +496,6 @@ def run_experiment(task_name: str, strategy: str) -> Dict[str, any]:
 
         try:
             start_time = time.time()
-            # 调用模块推理（适配新版模块返回格式）
             pred = module(input_text)
             latency = time.time() - start_time
             latencies.append(latency)
@@ -483,12 +511,14 @@ def run_experiment(task_name: str, strategy: str) -> Dict[str, any]:
 
             preds.append(pred_result)
 
-            # 统计 Token（从 predict 的 prompt 中获取）
-            prompt = module.predict.prompt if hasattr(module, "predict") and hasattr(module.predict, "prompt") else ""
-            prompt_tokens.append(count_tokens(prompt))
+            # 统计Token：从模块的 current_prompt 获取（修复统计为0的问题）
+            current_prompt = module.current_prompt if hasattr(module, "current_prompt") else (
+                pred.prompt if hasattr(pred, "prompt") else ""
+            )
+            prompt_tokens.append(count_tokens(current_prompt))
             output_tokens.append(count_tokens(pred_result))
 
-            if (i + 1) % 5 == 0:
+            if (i + 1) % 10 == 0:
                 print(f"  已完成 {i + 1}/{len(test_data)} 样本")
         except Exception as e:
             print(f"❌ 第 {i + 1} 样本推理失败：{str(e)}")
@@ -521,7 +551,7 @@ def run_experiment(task_name: str, strategy: str) -> Dict[str, any]:
     return result
 
 
-# ====================== 结果展示与 Demo（保持不变） ======================
+# ====================== 结果展示与 Demo ======================
 def print_results_table(results: List[Dict[str, any]]):
     valid_results = [res for res in results if res is not None]
     if not valid_results:
@@ -618,21 +648,26 @@ def interactive_demo():
         if task_name == "sentiment_classification":
             print(f"情感标签：{pred.label}（0=负面，1=正面）")
         elif task_name == "named_entity_recognition":
-            print(f"实体：{pred.entities}")
+            try:
+                entities = json.loads(str(pred.entities))
+                print(f"实体：{json.dumps(entities, ensure_ascii=False, indent=2)}")
+            except:
+                print(f"实体：{pred.entities}")
         elif task_name == "math_reasoning":
             print(f"答案：{pred.answer}")
             if hasattr(pred, "reasoning"):
                 print(f"\n【🧠 推理过程】\n{pred.reasoning}")
 
         print(f"\n【📊 性能】")
-        prompt = module.predict.prompt if hasattr(module, "predict") else ""
-        print(f"Prompt Token：{count_tokens(prompt)}")
-        print(
-            f"Output Token：{
-            count_tokens(
-                str(pred.answer if task_name == 'math_reasoning' else pred.label if task_name == 'sentiment_classification' else pred.entities)
-            )
-            }")
+        current_prompt = module.current_prompt if hasattr(module, "current_prompt") else (
+            pred.prompt if hasattr(pred, "prompt") else ""
+        )
+        prompt_tokens = count_tokens(current_prompt)
+        output = str(
+            pred.answer if task_name == "math_reasoning" else pred.label if task_name == "sentiment_classification" else pred.entities)
+        output_tokens = count_tokens(output)
+        print(f"Prompt Token：{prompt_tokens}")
+        print(f"Output Token：{output_tokens}")
         print(f"时延：{round(latency, 2)}s")
     except Exception as e:
         print(f"❌ 推理失败：{str(e)}")
@@ -653,7 +688,6 @@ if __name__ == "__main__":
     if mode == "1":
         results = []
         for task in TASKS:
-            # 选择任务支持的策略
             if task in ["sentiment_classification", "named_entity_recognition"]:
                 task_strategies = ["zero-shot", "few-shot"]
             else:
