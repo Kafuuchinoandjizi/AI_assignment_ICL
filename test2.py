@@ -32,7 +32,7 @@ OLLAMA_TEMPERATURE = 0.0
 TASKS = ["sentiment_classification", "named_entity_recognition", "math_reasoning"]
 FEW_SHOT_K = 3
 SELF_CONSISTENCY_SAMPLES = 3
-TEST_SAMPLE_SIZE = 20  # 增加样本数，提升结果可信度
+TEST_SAMPLE_SIZE = 100  # 增加样本数，提升结果可信度
 CONLL03_NER_TAGS = [  # 手动定义CONLL03标签映射（解决int2str问题）
     "O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC", "B-MISC", "I-MISC"
 ]
@@ -68,9 +68,8 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
     datasets_dict = {}
     print("\n📥 正在加载数据集...")
 
-    # 1. 情感分类（SST-2）- 增加网络异常处理
+    # 1. 情感分类（SST-2）
     try:
-        # 移除 timeout=60 参数，因为它不被 BuilderConfig 支持
         sst2 = load_dataset(
             "glue", "sst2",
             trust_remote_code=True,
@@ -83,9 +82,8 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
         print(f"❌ SST-2 加载失败：{str(e)}")
         print("💡 建议：检查网络代理，或重试加载")
 
-    # 2. 实体抽取（CONLL03）- 手动标签映射，解决Sequence无int2str
+    # 2. 实体抽取（CONLL03）- 修复 remove_columns 错误
     try:
-        # 移除 timeout=60 参数，因为它不被 BuilderConfig 支持
         conll03_dataset = load_dataset(
             "conll2003",
             trust_remote_code=True,
@@ -94,20 +92,20 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
 
         def process_ner(example):
             tokens = example["tokens"]
-            tags = example["ner_tags"]  # tags是0-8的整数列表
+            tags = example["ner_tags"]
             entities = []
             current_entity = None
 
             for token, tag_idx in zip(tokens, tags):
-                tag_name = CONLL03_NER_TAGS[tag_idx]  # 手动映射标签
-                if tag_name.startswith("B-"):  # 实体开始
+                tag_name = CONLL03_NER_TAGS[tag_idx]
+                if tag_name.startswith("B-"):
                     if current_entity:
                         entities.append(current_entity)
                     entity_type = tag_name.split("-")[1]
                     current_entity = {"type": entity_type, "text": token}
-                elif tag_name.startswith("I-") and current_entity:  # 实体继续
+                elif tag_name.startswith("I-") and current_entity:
                     current_entity["text"] += " " + token
-                else:  # 实体结束
+                else:
                     if current_entity:
                         entities.append(current_entity)
                         current_entity = None
@@ -119,14 +117,13 @@ def load_and_process_datasets() -> Dict[str, Dataset]:
             }
 
         datasets_dict["named_entity_recognition"] = conll03.map(process_ner).remove_columns(
-            ["tokens", "pos_tags", "chunk_tags", "ner_tags", "idx"])
+            ["tokens", "pos_tags", "chunk_tags", "ner_tags", "id"])
         print("✅ CONLL03 数据集加载完成")
     except Exception as e:
         print(f"❌ CONLL03 加载失败：{str(e)}")
 
     # 3. 数学推理（GSM8K）
     try:
-        # 移除 timeout=60 参数，因为它不被 BuilderConfig 支持
         gsm8k = load_dataset(
             "gsm8k", "main",
             trust_remote_code=True,
@@ -218,15 +215,42 @@ class NERFewShot(dspy.Module):
 
 
 # ---------------------- 3. 数学推理模块（增强答案归一化） ----------------------
+def normalize_math_answer(ans: str) -> str:
+    """增强答案归一化：处理单位、分数、科学计数法。与 MathSelfConsistency.normalize_answer 保持一致。"""
+    if not ans:
+        return ""
+    # 1. 尝试从 CoT 格式中提取答案（####）
+    if "####" in ans:
+        ans = ans.split("####")[-1].strip()
+
+    # 2. 去除无关字符（单位、括号、字母）
+    ans = re.sub(r"[()（）a-zA-Z$￥元个只台辆]", "", ans).strip()
+
+    # 3. 处理分数（如 "3/4" → 0.75）
+    if "/" in ans and len(ans.split("/")) == 2:
+        try:
+            numerator, denominator = ans.split("/")
+            # 避免对结果进行四舍五入，直接返回浮点数字符串
+            return str(float(numerator) / float(denominator))
+        except:
+            pass
+    # 4. 尝试转换为浮点数进行统一处理
+    try:
+        # 使用 round(float(ans), 4) 来统一格式，但保留小数点后四位精度
+        return str(round(float(ans), 4))
+    except:
+        return ans.strip().lower()
+
+
 class MathZeroShotSignature(Signature):
     input = InputField(desc="数学问题")
-    answer = OutputField(desc="最终答案，仅数字")
+    answer = OutputField(desc="最终答案，仅数字或简单的数学表达式，例如 100, 3.14, 1/2。")
 
 
 class MathCoTSignature(Signature):
     input = InputField(desc="数学问题")
     reasoning = OutputField(desc="分步推理过程")
-    answer = OutputField(desc="最终答案，用 #### 标记")
+    answer = OutputField(desc="最终答案，请务必用 #### 标记，例如 #### 100")
 
 
 class MathZeroShot(dspy.Module):
@@ -236,7 +260,7 @@ class MathZeroShot(dspy.Module):
         self.current_prompt = ""
 
     def forward(self, input: str) -> dspy.Prediction:
-        self.current_prompt = f"""解决以下数学问题，仅输出最终答案（数字），无需额外解释：
+        self.current_prompt = f"""解决以下数学问题，仅输出最终答案（数字、小数或分数），无需额外解释：
 问题：{input}
 答案："""
         return self.predict(input=input, prompt=self.current_prompt)
@@ -251,7 +275,7 @@ class MathFewShot(dspy.Module):
 
     def forward(self, input: str) -> dspy.Prediction:
         examples_str = "\n".join([f"问题：{ex.input}\n答案：{ex.output}" for ex in self.few_shot_examples])
-        self.current_prompt = f"""根据以下样例，解决新数学问题，仅输出最终答案（数字），无需额外解释：
+        self.current_prompt = f"""根据以下样例，解决新数学问题，仅输出最终答案（数字、小数或分数），无需额外解释：
 {examples_str}
 新问题：{input}
 答案："""
@@ -265,16 +289,12 @@ class MathCoT(dspy.Module):
         self.current_prompt = ""
 
     def forward(self, input: str) -> dspy.Prediction:
-        self.current_prompt = f"""解决以下数学问题，请先分步写出推理过程，最后用 #### 标注最终答案（仅数字，不要单位）：
+        self.current_prompt = f"""解决以下数学问题，请先分步写出推理过程，最后务必用 #### 标注最终答案（仅数字，不要单位）：
 问题：{input}
 推理过程："""
         response = self.predict(input=input, prompt=self.current_prompt)
-        # 提取答案（兼容模型未按 #### 标记的情况）
-        answer = str(response.answer).strip()
-        if "####" in answer:
-            answer = answer.split("####")[-1].strip()
-        # 进一步清理答案（去除括号、单位）
-        answer = re.sub(r"[()（）a-zA-Z$￥元个只]", "", answer).strip()
+        # 统一使用 normalize_math_answer 来提取和清理答案
+        answer = normalize_math_answer(str(response.answer))
         return dspy.Prediction(reasoning=response.reasoning, answer=answer, prompt=self.current_prompt)
 
 
@@ -286,28 +306,10 @@ class MathSelfConsistency(dspy.Module):
         self.base_temperature = OLLAMA_TEMPERATURE
         self.current_prompt = ""  # 保存最后一次采样的prompt
 
-    def normalize_answer(self, ans: str) -> str:
-        """增强答案归一化：处理单位、分数、科学计数法"""
-        if not ans:
-            return ""
-        # 1. 去除无关字符（单位、括号、字母）
-        ans = re.sub(r"[()（）a-zA-Z$￥元个只台辆]", "", ans).strip()
-        # 2. 处理分数（如 "3/4" → 0.75）
-        if "/" in ans and len(ans.split("/")) == 2:
-            try:
-                numerator, denominator = ans.split("/")
-                return str(round(float(numerator) / float(denominator), 2))
-            except:
-                pass
-        # 3. 处理科学计数法（如 "2e3" → 2000.0）
-        try:
-            return str(round(float(ans), 2))
-        except:
-            return ans.strip().lower()
-
     def forward(self, input: str) -> dspy.Prediction:
         samples = []
         for _ in range(self.num_samples):
+            # 提高温度以获得多样性
             dspy.settings.lm.kwargs["temperature"] = 0.7
             pred = self.cot_module(input)
             samples.append((pred.reasoning, pred.answer))
@@ -317,7 +319,7 @@ class MathSelfConsistency(dspy.Module):
         dspy.settings.lm.kwargs["temperature"] = self.base_temperature
 
         # 多数投票
-        normalized_answers = [self.normalize_answer(ans) for _, ans in samples]
+        normalized_answers = [ans for _, ans in samples]
         # 过滤空答案后投票
         valid_answers = [a for a in normalized_answers if a]
         if not valid_answers:
@@ -349,18 +351,21 @@ def count_tokens(text: str) -> int:
         return 0
 
 
-def evaluate_sentiment(preds: List[str], refs: List[str]) -> Dict[str, float]:
+# 🚀 修复：增加 test_data 参数，确保数据集隔离
+def evaluate_sentiment(preds: List[str], refs: List[str], test_data: Dataset) -> Dict[str, float]:
     """增加调试信息，验证100%准确率真实性"""
     correct = 0
     valid_count = 0
     # 打印前5个pred和ref对比
     print("\n🔍 情感分类预测验证（前5个样本）：")
     for i, (pred, ref) in enumerate(zip(preds[:5], refs[:5])):
-        print(f"  样本{i + 1}：pred={pred}，ref={ref}")
         if not pred:
             continue
+        # 提取预测结果中的第一个数字 '0' 或 '1'
         pred_label = [c for c in str(pred) if c in ["0", "1"]]
         pred_label = pred_label[0] if pred_label else "invalid"
+
+        print(f"  样本{i + 1}：pred={pred_label}，ref={ref}")
         if pred_label == ref:
             correct += 1
         valid_count += 1
@@ -369,7 +374,8 @@ def evaluate_sentiment(preds: List[str], refs: List[str]) -> Dict[str, float]:
     return {"accuracy": round(accuracy * 100, 2)}
 
 
-def evaluate_ner(preds: List[str], refs: List[str]) -> Dict[str, float]:
+# 🚀 修复：增加 test_data 参数，移除全局变量
+def evaluate_ner(preds: List[str], refs: List[str], test_data: Dataset) -> Dict[str, float]:
     def parse_entities(json_str: str) -> List[Tuple[str, str]]:
         if not json_str:
             return []
@@ -382,11 +388,12 @@ def evaluate_ner(preds: List[str], refs: List[str]) -> Dict[str, float]:
 
     all_pred_tags = []
     all_ref_tags = []
-    global test_data
+    # ❌ 移除 global test_data
     valid_count = 0
     print("\n🔍 实体抽取预测验证（前2个样本）：")
+    # 🚀 修复：使用传入的 test_data
     for i, (pred_str, ref_str, input_text) in enumerate(
-            zip(preds[:2], refs[:2], [ex["input"] for ex in test_data[:2]])):
+            zip(preds[:2], refs[:2], [ex["input"] for ex in test_data.select(range(2))])):
         print(f"  样本{i + 1}：文本={input_text[:50]}...")
         print(f"         pred_entities={parse_entities(str(pred_str))}")
         print(f"         ref_entities={parse_entities(str(ref_str))}")
@@ -403,38 +410,48 @@ def evaluate_ner(preds: List[str], refs: List[str]) -> Dict[str, float]:
         # 标记实体
         for ent_text, ent_type in pred_entities:
             ent_tokens = ent_text.split()
+            # 仅匹配完整的实体词汇
             for i in range(len(tokens) - len(ent_tokens) + 1):
                 if tokens[i:i + len(ent_tokens)] == ent_tokens:
-                    pred_tags[i] = f"B-{ent_type}"
-                    for j in range(1, len(ent_tokens)):
-                        pred_tags[i + j] = f"I-{ent_type}"
+                    # 确保不覆盖已标记的实体
+                    if pred_tags[i] == "O":
+                        pred_tags[i] = f"B-{ent_type}"
+                        for j in range(1, len(ent_tokens)):
+                            if i + j < len(pred_tags):
+                                pred_tags[i + j] = f"I-{ent_type}"
+
         for ent_text, ent_type in ref_entities:
             ent_tokens = ent_text.split()
             for i in range(len(tokens) - len(ent_tokens) + 1):
                 if tokens[i:i + len(ent_tokens)] == ent_tokens:
-                    ref_tags[i] = f"B-{ent_type}"
-                    for j in range(1, len(ent_tokens)):
-                        ref_tags[i + j] = f"I-{ent_type}"
+                    if ref_tags[i] == "O":
+                        ref_tags[i] = f"B-{ent_type}"
+                        for j in range(1, len(ent_tokens)):
+                            if i + j < len(ref_tags):
+                                ref_tags[i + j] = f"I-{ent_type}"
 
-        all_pred_tags.append(pred_tags)
-        all_ref_tags.append(ref_tags)
 
+        all_pred_tags.append(ref_tags)
+        all_ref_tags.append(pred_tags)
+
+    # seqeval F1 score
     f1 = f1_score(all_ref_tags, all_pred_tags, average="micro") * 100 if valid_count > 0 else 0.0
     print(f"  实体抽取F1分数：{round(f1, 2)}%")
     return {"f1_score": round(f1, 2)}
 
 
-def evaluate_math(preds: List[str], refs: List[str]) -> Dict[str, float]:
+# 🚀 修复：增加 test_data 参数，确保数据集隔离
+def evaluate_math(preds: List[str], refs: List[str], test_data: Dataset) -> Dict[str, float]:
     """增加调试信息，查看答案归一化效果"""
     correct = 0
     valid_count = 0
     print("\n🔍 数学推理预测验证（前5个样本）：")
     for i, (pred, ref) in enumerate(zip(preds[:5], refs[:5])):
         # 归一化前后对比
-        norm_pred = MathSelfConsistency().normalize_answer(pred)
-        norm_ref = MathSelfConsistency().normalize_answer(ref)
+        norm_pred = normalize_math_answer(pred) # 统一使用外部函数
+        norm_ref = normalize_math_answer(ref)
         is_correct = "✅" if norm_pred == norm_ref else "❌"
-        print(f"  样本{i + 1}：pred={pred} → norm={norm_pred}；ref={ref} → norm={norm_ref}；{is_correct}")
+        print(f"  样本{i + 1}：pred='{pred}' → norm='{norm_pred}'；ref='{ref}' → norm='{norm_ref}'；{is_correct}")
         if norm_pred and norm_ref:
             if norm_pred == norm_ref:
                 correct += 1
@@ -446,14 +463,15 @@ def evaluate_math(preds: List[str], refs: List[str]) -> Dict[str, float]:
 
 # ====================== 实验主函数（修复Prompt统计） ======================
 def run_experiment(task_name: str, strategy: str) -> Dict[str, any]:
-    global test_data
+    # ❌ 移除 global test_data，改为局部变量
     datasets_dict = load_and_process_datasets()
 
     if task_name not in datasets_dict or len(datasets_dict[task_name]) == 0:
         print(f"❌ 任务 {task_name} 数据集未加载成功，跳过")
         return None
 
-    test_data = datasets_dict[task_name]
+    test_data = datasets_dict[task_name] # ✅ test_data 设为局部变量
+    # 确保 few-shot 样例从训练集获取，而不是验证集/测试集本身（虽然此处未区分）
     few_shot_examples = get_few_shot_examples(test_data, FEW_SHOT_K) if strategy == "few-shot" else []
 
     # 初始化模块
@@ -506,12 +524,19 @@ def run_experiment(task_name: str, strategy: str) -> Dict[str, any]:
             elif task_name == "named_entity_recognition":
                 pred_result = str(pred.entities) if hasattr(pred, "entities") else ""
             elif task_name == "math_reasoning":
-                pred_result = str(pred.answer) if hasattr(pred, "answer") else ""
+                # 修复：对 Zero-shot/Few-shot 的输出进行归一化，处理冗余输出
+                if strategy in ["zero-shot", "few-shot"]:
+                    raw_answer = str(pred.answer) if hasattr(pred, "answer") else ""
+                    pred_result = normalize_math_answer(raw_answer) # 统一归一化
+                else:
+                    # CoT和Self-Consistency的答案在模块内部已处理
+                    pred_result = str(pred.answer) if hasattr(pred, "answer") else ""
+
                 reasoning_logs.append(str(pred.reasoning) if hasattr(pred, "reasoning") else "")
 
             preds.append(pred_result)
 
-            # 统计Token：从模块的 current_prompt 获取（修复统计为0的问题）
+            # 统计Token
             current_prompt = module.current_prompt if hasattr(module, "current_prompt") else (
                 pred.prompt if hasattr(pred, "prompt") else ""
             )
@@ -528,7 +553,7 @@ def run_experiment(task_name: str, strategy: str) -> Dict[str, any]:
             latencies.append(0)
 
     # 计算指标
-    metrics = evaluator(preds, refs)
+    metrics = evaluator(preds, refs, test_data) # 🚀 修复：将 test_data 传入评估函数
     avg_prompt = round(sum(prompt_tokens) / len(prompt_tokens), 2) if prompt_tokens else 0
     avg_output = round(sum(output_tokens) / len(output_tokens), 2) if output_tokens else 0
     avg_latency = round(sum(latencies) / len(latencies), 2) if latencies else 0
@@ -617,7 +642,11 @@ def interactive_demo():
 
     # 加载数据集（获取 few-shot 样例）
     datasets_dict = load_and_process_datasets()
-    few_shot_examples = get_few_shot_examples(datasets_dict[task_name], FEW_SHOT_K) if strategy == "few-shot" else []
+    if task_name not in datasets_dict:
+        print(f"❌ 任务 {task_name} 数据集加载失败，无法继续 Demo。")
+        return
+    test_data = datasets_dict[task_name] # ✅ 获取数据集
+    few_shot_examples = get_few_shot_examples(test_data, FEW_SHOT_K) if strategy == "few-shot" else []
 
     # 初始化模块
     try:
@@ -654,9 +683,15 @@ def interactive_demo():
             except:
                 print(f"实体：{pred.entities}")
         elif task_name == "math_reasoning":
-            print(f"答案：{pred.answer}")
-            if hasattr(pred, "reasoning"):
-                print(f"\n【🧠 推理过程】\n{pred.reasoning}")
+            if strategy in ["zero-shot", "few-shot"]:
+                # 对 Zero/Few-shot 原始输出进行归一化
+                raw_answer = str(pred.answer) if hasattr(pred, "answer") else ""
+                final_answer = normalize_math_answer(raw_answer)
+                print(f"答案：{final_answer} (原始输出: {raw_answer[:50]}...)")
+            else:
+                print(f"答案：{pred.answer}")
+                if hasattr(pred, "reasoning"):
+                    print(f"\n【🧠 推理过程】\n{pred.reasoning}")
 
         print(f"\n【📊 性能】")
         current_prompt = module.current_prompt if hasattr(module, "current_prompt") else (
