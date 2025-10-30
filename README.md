@@ -16,4 +16,4 @@ ICL上下文学习
 
 ​	五、示例代码仓库 DSPy LM-Eval-Harness
 
-![image-20251030182819855](C:\Users\ASUS\AppData\Roaming\Typora\typora-user-images\image-20251030182819855.png)
+[作业提交链接](https://bhpan.buaa.edu.cn/link/AA287BF400953D465193CF839DAD5E9FD6)  [组队表格链接](https://www.kdocs.cn/l/cc1W7S85mCIZ)
