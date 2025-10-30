@@ -17,3 +17,5 @@ ICL上下文学习
 ​	五、示例代码仓库 DSPy LM-Eval-Harness
 
 [作业提交链接](https://bhpan.buaa.edu.cn/link/AA287BF400953D465193CF839DAD5E9FD6)  [组队表格链接](https://www.kdocs.cn/l/cc1W7S85mCIZ)
+
+![image](https://github.com/Kafuuchinoandjizi/AI_assignment_ICL/blob/branch_1/IMG/%E5%B1%8F%E5%B9%95%E6%88%AA%E5%9B%BE%202025-10-30%20183520.png)
